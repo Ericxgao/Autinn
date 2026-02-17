@@ -25,8 +25,28 @@ static const int oversample2 = 2;
 static const int oversample4 = 4;
 static const int oversample8 = 8;
 
-#define DRIVE_MAX 10.0f
-#define DRIVE_MIN 0.1f
+#define DRIVE_MAX 25.0f
+#define DRIVE_MIN 0.0f
+
+struct SimpleDCBlocker {
+	float x1 = 0.0f;
+	float y1 = 0.0f;
+	// 0.999 creates a cutoff around 10Hz-20Hz, perfect for DC blocking
+	const float R = 0.999f;
+
+	float process(float x) {
+		// Standard DC Block formula: y[n] = x[n] - x[n-1] + R * y[n-1]
+		float y = x - x1 + R * y1;
+		x1 = x;
+		y1 = y;
+		return y;
+	}
+
+	void reset() {
+		x1 = 0.0f;
+		y1 = 0.0f;
+	}
+};
 
 struct Fil : Module {
 	enum ParamIds {
@@ -50,7 +70,7 @@ struct Fil : Module {
 
 	Fil() {
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
-		configParam(DIAL_PARAM, 0.0f, 1.0f, 0.25f, "Drive", " ", DRIVE_MAX/DRIVE_MIN, DRIVE_MIN);
+		configParam<Param3Digits>(DIAL_PARAM, 0.0f, 1.0f, 0.25f, "Drive", " ", 0.0f, DRIVE_MAX);
 		configBypass(FIL_INPUT, FIL_OUTPUT);
 		configInput(FIL_INPUT, "Audio");
 		configOutput(FIL_OUTPUT, "Audio");
@@ -63,12 +83,14 @@ struct Fil : Module {
 	int current_oversample = 4;
 	float th=1.0f/3.0f;
 
-	dsp::Upsampler<oversample2, 10> upsampler2;
-	dsp::Decimator<oversample2, 10> decimator2;
-	dsp::Upsampler<oversample4, 10> upsampler4;
-	dsp::Decimator<oversample4, 10> decimator4;
-	dsp::Upsampler<oversample8, 10> upsampler8;
-	dsp::Decimator<oversample8, 10> decimator8;
+	SimpleDCBlocker dcBlocker[16];
+
+	dsp::Upsampler<oversample2, 10> upsampler2[16];
+	dsp::Decimator<oversample2, 10> decimator2[16];
+	dsp::Upsampler<oversample4, 10> upsampler4[16];
+	dsp::Decimator<oversample4, 10> decimator4[16];
+	dsp::Upsampler<oversample8, 10> upsampler8[16];
+	dsp::Decimator<oversample8, 10> decimator8[16];
 
 	json_t *dataToJson() override {
 		json_t *root = json_object();
@@ -102,61 +124,77 @@ void Fil::process(const ProcessArgs &args) {
 		return;
 	}
 
-	float in = 0.20f * inputs[FIL_INPUT].getVoltage() * (params[DIAL_PARAM].getValue() * (DRIVE_MAX - DRIVE_MIN) + DRIVE_MIN);
-	float out = 0.0f;
+	int channels = std::max(1, inputs[FIL_INPUT].getChannels());
+	outputs[FIL_OUTPUT].setChannels(channels);
 
-	float inInter [current_oversample];
-	float outBuf  [current_oversample];
-	if (current_oversample == oversample2) {
-		upsampler2.process(in, inInter);
-	} else if (current_oversample == oversample4) {
-		upsampler4.process(in, inInter);
-	} else {
-		upsampler8.process(in, inInter);
-	}
-	
-	for (int i = 0; i < current_oversample; i++) {
-		if (fabs(inInter[i]) < th) {
-			out = 2.0f*inInter[i];
-			if (i==0) {
-				lights[LOW_LIGHT].value = fabs(out)/(th*2.0f);
-				lights[MID_LIGHT].value = 0.0f;
-				lights[HIGH_LIGHT].value = 0.0f;
-			}
-		} else if (fabs(inInter[i]) <= 2.0f*th) {
-			if (inInter[i] > 0.0f) {
-				out = (3.0f-(2.0f-inInter[i]*3.0f)*(2.0f-inInter[i]*3.0f))/3.0f;
-			} else {
-			    out = -(3.0f-(2.0f-fabs(inInter[i])*3.0f)*(2.0f-fabs(inInter[i])*3.0f))/3.0f;
-			}
-			if (i==0) {
-				lights[MID_LIGHT].value = (fabs(out)-th*2.0f)*3.0f;
-				lights[LOW_LIGHT].value = 0.0f;
-				lights[HIGH_LIGHT].value = 0.0f;
-			}
+	float driveGain = 0.2f * (1.0f + params[DIAL_PARAM].getValue() * DRIVE_MAX);
+
+	for (int c = 0; c < channels; c++) {
+		float in = inputs[FIL_INPUT].getPolyVoltage(c) * driveGain;
+		float out = 0.0f;
+
+		float inInter [8];// max oversample size
+		float outBuf  [8];
+		if (current_oversample == oversample2) {
+			upsampler2[c].process(in, inInter);
+		} else if (current_oversample == oversample4) {
+			upsampler4[c].process(in, inInter);
 		} else {
-			if (inInter[i] > 0.0f) {
-				out =  1.0f;
-			} else {
-				out = -1.0f;
+			upsampler8[c].process(in, inInter);
+		}
+
+		for (int i = 0; i < current_oversample; i++) {
+			float x = inInter[i];
+			if (std::abs(x) < 1e-15f) x = 0.0f; // Denormal protection
+
+			// Overdrive
+
+			// Asymmetric Tube Bias
+			// Adding x*x creates Even Harmonics (Warmth).
+			// At high volumes, large negative values will 'fold' back positive (Grit).
+			float tube_bias = x + 0.25f * x * x;
+
+			float drive_amount = tube_bias * 0.5f;
+
+			// Soft saturation (The tube limit)
+			// non_lin handles the clipping smoothly like a vacuum tube.
+			float saturated = non_lin_func(drive_amount);
+
+			// Safety Check
+			if (!std::isfinite(saturated)) {
+				saturated = 0.0f;
 			}
-			if (i==0) {
-				lights[HIGH_LIGHT].value = (fabs(inInter[i])-th*2.0f)*2.0f;
-				lights[MID_LIGHT].value = 0.0f;
-				lights[LOW_LIGHT].value = 0.0f;
+
+			outBuf[i] = saturated;
+
+			// Update Lights based on saturation intensity
+			if (c == 0 && i == 0) {
+				float drive_abs = std::abs(drive_amount);
+
+				// Green: Signal Indicator (Fades in quickly)
+				// Shows if any signal is present.
+				lights[LOW_LIGHT].value = clamp(drive_abs * 10.0f, 0.0f, 1.0f);
+
+				// Yellow: Warmth Indicator (Fades in from 0.4 to 0.8)
+				// Turns on when the tube starts "bending" the waveform.
+				lights[MID_LIGHT].value = clamp((drive_abs - 0.4f) * 2.5f, 0.0f, 1.0f);
+
+				// Red: Overdrive Indicator (Fades in from 1.0 to 1.4)
+				// Turns on when you hit the saturation ceiling.
+				lights[HIGH_LIGHT].value = clamp((drive_abs - 1.0f) * 2.5f, 0.0f, 1.0f);
 			}
 		}
-		outBuf[i] = non_lin_func(out);
-	}
-	if (current_oversample == oversample2) {
-		out = decimator2.process(outBuf);
-	} else if (current_oversample == oversample4) {
-		out = decimator4.process(outBuf);
-	} else {
-		out = decimator8.process(outBuf);
-	}
 
-    outputs[FIL_OUTPUT].setVoltage(out*5.0f);
+		if (current_oversample == oversample2) {
+			out = decimator2[c].process(outBuf);
+		} else if (current_oversample == oversample4) {
+			out = decimator4[c].process(outBuf);
+		} else {
+			out = decimator8[c].process(outBuf);
+		}
+		out = dcBlocker[c].process(out);
+		outputs[FIL_OUTPUT].setVoltage(out*5.0f, c);
+	}
 }
 
 struct OversampleFilMenuItem : MenuItem {
@@ -171,6 +209,15 @@ struct OversampleFilMenuItem : MenuItem {
 
 	void onAction(const event::Action &e) override {
 		_module->current_oversample = _os;
+
+		for (int c = 0; c < 16; c++) {
+			_module->upsampler2[c].reset();
+			_module->decimator2[c].reset();
+			_module->upsampler4[c].reset();
+			_module->decimator4[c].reset();
+			_module->upsampler8[c].reset();
+			_module->decimator8[c].reset();
+		}
 	}
 
 	void step() override {

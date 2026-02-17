@@ -23,37 +23,6 @@
 // The pluginInstance-wide instance of the Plugin class
 Plugin *pluginInstance;
 
-float non_lin_func(float parm) {
-	// 7 divisions in continued fraction series expansion
-	if (parm > 4.97f) {
-		return 1.0f;
-	}
-	if (parm < -4.97f) {
-		return -1.0f;
-	}
-	double x2 = double(parm) * double(parm);
-	double a = double(parm) * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2)));
-	double b = 135135.0 + x2 * (62370.0 + x2 * (3150.0 + x2 * 28.0));
-	return a / b;
-}
-
-float non_lin_func2(float parm) {
-	return 2.0f * (exp(parm)-exp(-parm));
-}
-
-float slew(float input, float input_prev, float maxChangePerSec, float dt) {
-	float delta = input - input_prev;
-
-	if(maxChangePerSec*dt < delta) {
-		delta = maxChangePerSec*dt;
-	}
-	if(-maxChangePerSec*dt > delta) {
-		delta = -maxChangePerSec*dt;
-	}
-	input_prev += delta;
-
-	return input_prev;
-}
 
 void init(rack::Plugin *p) {
 	pluginInstance = p;
@@ -95,4 +64,6 @@ void init(rack::Plugin *p) {
 	p->addModel(modelNap);
 	p->addModel(modelMelody);
 	// p->addModel(modelChord);
+	p->addModel(modelCoil);
+	p->addModel(modelScope);
 }

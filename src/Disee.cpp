@@ -1,8 +1,5 @@
 #include "Autinn.hpp"
 #include <cmath>
-#include <queue>
-
-using std::queue;
 
 /*
 
@@ -43,9 +40,7 @@ struct Disee : Module {
 		NUM_LIGHTS
 	};
 
-	float dc_prev;
-	unsigned size = 12500;// fixed for now.
-	queue <float> buffer;
+	float dcFilter[16] = {};
 
 	Disee() {
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
@@ -66,36 +61,37 @@ void Disee::process(const ProcessArgs &args) {
 	// VCV Rack audio rate is +-5V
 	// VCV Rack CV is +-5V or 0V-10V
 
-	// TODO: Make buffer size depend on bitrate and review the time it should average over.
-	//       Right now its 0.28 seconds for 44.1KHz
-	//       Right now its 0.26 seconds for 48.0KHz
-	
-	float in = inputs[AC_INPUT].getVoltage()/size;
-	buffer.push(in);
-	float in_oldest = buffer.front();
-	float dc = dc_prev - in_oldest + in;
-	dc_prev = dc;
-	if (buffer.size() < size) {
-		lights[DC_GREEN_LIGHT].value = 0.0f;
-		lights[DC_RED_LIGHT].value = 0.0f;
-		lights[DC_BLUE_LIGHT].value = 0.0f;
-		return;
+	int channels = std::max(1, inputs[AC_INPUT].getChannels());
+	outputs[DC_OUTPUT].setChannels(channels);
+
+	// Calculate a coefficient for a Lowpass filter
+	// averages the signal over ~1 second
+	float cutoffFreq = 1.0f;
+	float lambda = 2.0f * M_PI * cutoffFreq * args.sampleTime;
+
+	for (int c = 0; c < channels; c++) {
+		// One-Pole Filter
+		dcFilter[c] += (inputs[AC_INPUT].getPolyVoltage(c) - dcFilter[c]) * lambda;
+
+		outputs[DC_OUTPUT].setVoltage(clamp(dcFilter[c], -10.0f, 10.0f));
+
+		if (c == 0) {
+			// Update lights based on the filtered DC value
+			if (std::abs(dcFilter[c]) < 0.05f) {
+				lights[DC_GREEN_LIGHT].value = 1.0f;
+				lights[DC_RED_LIGHT].value = 0.0f;
+				lights[DC_BLUE_LIGHT].value = 0.0f;
+			} else if (dcFilter[c] < 0.0f) {
+				lights[DC_GREEN_LIGHT].value = 0.0f;
+				lights[DC_RED_LIGHT].value = 0.0f;
+				lights[DC_BLUE_LIGHT].value = clamp(-dcFilter[c], 0.25f, 1.0f);
+			} else {
+				lights[DC_GREEN_LIGHT].value = 0.0f;
+				lights[DC_RED_LIGHT].value = clamp(dcFilter[c], 0.25f, 1.0f);
+				lights[DC_BLUE_LIGHT].value = 0.0f;
+			}
+		}
 	}
-	outputs[DC_OUTPUT].setVoltage(clamp(dc,-10000.0f,10000.0f));
-	buffer.pop();
-	if (fabs(dc) < 0.05f) {
-		lights[DC_GREEN_LIGHT].value = 1.0f;
-		lights[DC_RED_LIGHT].value = 0.0f;
-		lights[DC_BLUE_LIGHT].value = 0.0f;
-	} else if (dc < 0.0f) {
-		lights[DC_GREEN_LIGHT].value = 0.0f;
-		lights[DC_RED_LIGHT].value = 0.0f;
-		lights[DC_BLUE_LIGHT].value = clamp(-dc,0.25f,1.0f);
-	} else {
-		lights[DC_GREEN_LIGHT].value = 0.0f;
-		lights[DC_RED_LIGHT].value = clamp(dc,0.25f,1.0f);
-		lights[DC_BLUE_LIGHT].value = 0.0f;
-	}	
 }
 
 struct DiseeWidget : ModuleWidget {

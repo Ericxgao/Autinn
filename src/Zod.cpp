@@ -1,8 +1,5 @@
 #include "Autinn.hpp"
 #include <cmath>
-#include <queue>
-
-using std::queue;
 /*
 
     Autinn VCV Rack Plugin
@@ -23,17 +20,18 @@ using std::queue;
 
 **/
 
-#define HYSTERESIS_TIME_SEC               0.0003
+//#define HYSTERESIS_TIME_SEC               0.0003
 #define THRESHOLD_DEFAULT_NOISEGATE_DB  -70.0
 #define THRESHOLD_DEFAULT_EXPANDER_DB   -60.0
 #define THRESHOLD_DEFAULT_COMPRESSOR_DB  -6.0
 #define THRESHOLD_DEFAULT_LIMITER_DB      7.5
+#define THRESHOLD_LIMIT_LOW_DB_LIMITER  -15.0//1.00V
 #define THRESHOLD_LIMIT_LOW_DB          -70.0//0.05V
 #define THRESHOLD_LIMIT_HIGH_DB           7.5//12.0V
 #define ATTACK_LOW_MS                     1.0//was 0.16
 #define ATTACK_HIGH_MS                 2600.0
 #define ATTACK_LIMITER_LOW_MS             0.1//was 0.02
-#define ATTACK_LIMITER_HIGH_MS           10.0
+#define ATTACK_LIMITER_HIGH_MS            2.0
 #define RELEASE_LOW_MS                    1.0
 #define RELEASE_HIGH_MS                5000.0
 #define RMS_TIME_LOW_MS                   1.0
@@ -44,6 +42,7 @@ using std::queue;
 #define KNEE_MAX_DB                      10.0
 #define KNEE_DEFAULT_DB                   5.0
 #define MAKEUP_GAIN_MAX                  10.0//20dB
+#define LOOKAHEAD_MS                      4.0// must be bigger than ATTACK_LIMITER_HIGH_MS
 
 struct Zod : Module {
 	enum ParamIds {
@@ -95,6 +94,7 @@ struct Zod : Module {
 
 	double g_prev = 1.0;
 	double f_prev = 0.0;
+	bool noisegateActive_prev = false;
 	double peak_prev = 0.0;
 	double rms2_prev = 0.0;
 	unsigned hysteresis = 0;
@@ -102,8 +102,12 @@ struct Zod : Module {
 	bool limiter = false;
 
 	unsigned D = 2;
-	queue <float> bufferL;
-	queue <float> bufferR;
+	// Ring Buffer: Max delay ~350ms @ 768kHz = ~268k samples. Plus oversampling.
+	// We use 2^21 for safety and power-of-two masking if needed.
+	static const int BUFFER_SIZE = 65536;
+	float bufferL[BUFFER_SIZE] = {};
+	float bufferR[BUFFER_SIZE] = {};
+	int writeIndex = 0;
 
 	// these are here to optimize so not to do expensive ops every step:
 	double ta = -150.0;
@@ -123,6 +127,7 @@ struct Zod : Module {
 	double RT = 0.1;
 	double AT = 0.1;
 	double ATp = 0.1;
+	double ATn = 0.1;
 	double TAV = 0.03;
 
 	// VU Meter stuff
@@ -134,20 +139,24 @@ struct Zod : Module {
 	const float intervalDB = vuMaxDB/15.0f;
 	unsigned short int step = 0;
 
+	static const int OVERSAMPLE = 4;
+	dsp::Upsampler<OVERSAMPLE, 12> upsampler[2];
+	dsp::Decimator<OVERSAMPLE, 12> decimator[2];
+
 	Zod() {
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
-		configParam(Zod::T_NOISEGATE_PARAM,  THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_NOISEGATE_DB, "Noisegate", " dB", 0.0f, 1.0f);
-		configParam(Zod::T_EXPANDER_PARAM,   THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_EXPANDER_DB, "Expander", " dB", 0.0f, 1.0f);
-		configParam(Zod::T_COMPRESSOR_PARAM, THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_COMPRESSOR_DB, "Compressor", " dB", 0.0f, 1.0f);
-		configParam(Zod::T_LIMITER_PARAM,    THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_LIMITER_DB, "Limiter", " dB", 0.0f, 1.0f);
+		configParam<Param3Digits>(Zod::T_NOISEGATE_PARAM,  THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_NOISEGATE_DB, "Noisegate", " dB", 0.0f, 1.0f);
+		configParam<Param3Digits>(Zod::T_EXPANDER_PARAM,   THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_EXPANDER_DB, "Expander", " dB", 0.0f, 1.0f);
+		configParam<Param3Digits>(Zod::T_COMPRESSOR_PARAM, THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_COMPRESSOR_DB, "Compressor", " dB", 0.0f, 1.0f);
+		configParam<Param3Digits>(Zod::T_LIMITER_PARAM,    THRESHOLD_LIMIT_LOW_DB_LIMITER, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_LIMITER_DB, "Limiter", " dB", 0.0f, 1.0f);
 		configParam(Zod::AVERAGE_TIME_PARAM, RMS_TIME_LOW_MS, RMS_TIME_HIGH_MS, RMS_TIME_DEFAULT_MS, "Average", " ms", 0.0f, 1.0f);
 		configParam(Zod::ATTACK_PARAM, 0.0, 1.0, 0.5, "Attack", " ms", ATTACK_HIGH_MS / ATTACK_LOW_MS, ATTACK_LOW_MS);
 		configParam(Zod::RELEASE_PARAM, 0.0, 1.0, 0.5, "Release", " ms", RELEASE_HIGH_MS / RELEASE_LOW_MS, RELEASE_LOW_MS);
 		configParam(Zod::ATTACK_PEAK_PARAM, 0.0, 1.0, 0.5, "Limiter attack", " ms", ATTACK_LIMITER_HIGH_MS / ATTACK_LIMITER_LOW_MS, ATTACK_LIMITER_LOW_MS);
 		configParam(Zod::RATIO_EXPANDER_PARAM, 1.0, 0.0, 1.0, "Expander ratio  1 ", "", 1.0f / EXPANDER_RATIO_MIN, EXPANDER_RATIO_MIN);
-		configParam(Zod::RATIO_COMPRESSOR_PARAM, 0.0, 1.0, 0.0, "Compressor ratio", ":1", COMPRESSOR_RATIO_MAX / 1.0f, 1.0f);
-		configParam(Zod::KNEE_PARAM, 0.0, KNEE_MAX_DB, KNEE_DEFAULT_DB, "Knee softness", " dB", 0.0f, 1.0f);
-		configParam(Zod::OUT_GAIN_PARAM, 0.0, 1.0, 0.0, "Makeup gain", " dB", 0.0f, 20.0f);
+		configParam<Param3Digits>(Zod::RATIO_COMPRESSOR_PARAM, 0.0, 1.0, 0.0, "Compressor ratio", ":1", COMPRESSOR_RATIO_MAX / 1.0f, 1.0f);
+		configParam<Param3Digits>(Zod::KNEE_PARAM, 0.0, KNEE_MAX_DB, KNEE_DEFAULT_DB, "Knee softness", " dB", 0.0f, 1.0f);
+		configParam<Param3Digits>(Zod::OUT_GAIN_PARAM, 0.0, 1.0, 0.0, "Makeup gain", " dB", 0.0f, 20.0f);
 
 		configLight(A, "Noise gate");
 		configLight(B, "Expander");
@@ -172,7 +181,7 @@ struct Zod : Module {
 	}
 
 	double toDB(double volt);
-	double toGain(double dB);
+	static double toGain(double dB);
 	double smooth(double k, double g_prev, double f);
 	double peak(double x, double ATp, double RT);
 	double rms(double x);
@@ -298,31 +307,34 @@ void Zod::process(const ProcessArgs &args) {
 
 	if (inputs[N_INPUT].isConnected()) {
 		if (inputs[N_INPUT].getVoltage() == 0.0f) NT = THRESHOLD_LIMIT_LOW_DB;
-		else NT = this->toDB(fabs(inputs[N_INPUT].getVoltage()));
+		else NT = this->toDB(fabsf(inputs[N_INPUT].getVoltage()));
 		params[T_NOISEGATE_PARAM].setValue(NT);
 	}
 	if (inputs[E_INPUT].isConnected()) {
 		if (inputs[E_INPUT].getVoltage() == 0.0f) ET = THRESHOLD_LIMIT_LOW_DB;
-		else ET = this->toDB(fabs(inputs[E_INPUT].getVoltage()));
+		else ET = this->toDB(fabsf(inputs[E_INPUT].getVoltage()));
 		params[T_EXPANDER_PARAM].setValue(ET);
 	}
 	if (inputs[C_INPUT].isConnected()) {
 		if (inputs[C_INPUT].getVoltage() == 0.0f) CT = THRESHOLD_LIMIT_LOW_DB;
-		else CT = this->toDB(fabs(inputs[C_INPUT].getVoltage()));
+		else CT = this->toDB(fabsf(inputs[C_INPUT].getVoltage()));
 		params[T_COMPRESSOR_PARAM].setValue(CT);
 	}
 	if (inputs[L_INPUT].isConnected()) {
-		if (inputs[L_INPUT].getVoltage() == 0.0f) LT = THRESHOLD_LIMIT_LOW_DB;
-		else LT = this->toDB(fabs(inputs[L_INPUT].getVoltage()));
-		params[T_LIMITER_PARAM].setValue(LT);
+		if (inputs[L_INPUT].getVoltage() == 0.0f) LT = THRESHOLD_LIMIT_LOW_DB_LIMITER;
+		else LT = this->toDB(fabsf(inputs[L_INPUT].getVoltage()));
+		params[T_LIMITER_PARAM].setValue(std::max(LT, THRESHOLD_LIMIT_LOW_DB_LIMITER));
 	}
 
-	double TS = args.sampleTime * 1000.0; //ms
+	double TS = (args.sampleTime / OVERSAMPLE) * 1000.0; //ms
 
 	if (taKnob != params[ATTACK_PARAM].getValue() || tapKnob != params[ATTACK_PEAK_PARAM].getValue() || trKnob != params[RELEASE_PARAM].getValue() || erKnob != params[RATIO_EXPANDER_PARAM].getValue() || crKnob != params[RATIO_COMPRESSOR_PARAM].getValue() || rate != args.sampleRate || tavKnob != params[AVERAGE_TIME_PARAM].getValue() || gainKnob != params[OUT_GAIN_PARAM].getValue()) {
 		rate = args.sampleRate;
 		tavKnob = params[AVERAGE_TIME_PARAM].getValue();
-		D   = (unsigned)(rate * tavKnob * 0.001);
+
+		D   = (unsigned)(rate * LOOKAHEAD_MS * 0.001 * OVERSAMPLE);
+		// Safety clamp to prevent buffer overflow at high sample rates
+		if (D >= BUFFER_SIZE) D = BUFFER_SIZE - 1;
 
 		taKnob = params[ATTACK_PARAM].getValue();
 		tapKnob = params[ATTACK_PEAK_PARAM].getValue();
@@ -341,118 +353,156 @@ void Zod::process(const ProcessArgs &args) {
 		RT  = 1.0 - exp(-2.2 * TS / tr );
 		AT  = 1.0 - exp(-2.2 * TS / ta );
 		ATp = 1.0 - exp(-2.2 * TS / tap);
+		ATn = 1.0 - exp(-2.2 * TS / ATTACK_LIMITER_LOW_MS);
 
-		double t_M = TS * D;
+		// Calculate RMS Window (t_M) directly from the Knob.
+		// Now RMS is 350ms, but Lookahead is only 5ms.
+		double t_M = tavKnob;
+		// Prevent division by zero
+		if (t_M < 0.1) t_M = 0.1;
 		TAV = 1.0 - exp(-2.2 * TS / t_M);
 	}
 
-	unsigned hyst_max = HYSTERESIS_TIME_SEC / args.sampleTime;
+	//unsigned hyst_max = (unsigned)((HYSTERESIS_TIME_SEC / args.sampleTime) * OVERSAMPLE);
 
 	// inputs:
-	float left  = inputs[LEFT_INPUT].getVoltage();
-	float right = inputs[RIGHT_INPUT].getVoltage();
-	bufferL.push(left);
-	bufferR.push(right);
-	float pastL = bufferL.front();
-	float pastR = bufferR.front();
-	while (bufferL.size() > D) {
-		bufferL.pop();
-		bufferR.pop();
-	}
-	double stereo = left + right;
+	float leftInput  = inputs[LEFT_INPUT].getVoltage();
+	float rightInput = inputs[RIGHT_INPUT].getVoltage();
 
-	if (inputs[SIDE_LEFT_INPUT].isConnected() || inputs[SIDE_RIGHT_INPUT].isConnected()) {
-		stereo = inputs[SIDE_LEFT_INPUT].getVoltage() + inputs[SIDE_RIGHT_INPUT].getVoltage();
-	}
+	// Upsample
+	float inBufL[OVERSAMPLE];
+	float inBufR[OVERSAMPLE];
+	float outBufL[OVERSAMPLE];
+	float outBufR[OVERSAMPLE];
 
-	double knee = params[KNEE_PARAM].getValue();//dB
+	upsampler[0].process(leftInput, inBufL);
+	upsampler[1].process(rightInput, inBufR);
 
-	// some values:
+	// Oversampled Physics Loop
+	for (int i = 0; i < OVERSAMPLE; i++) {
+		float left = inBufL[i];
+		float right = inBufR[i];
 
-	double CS = 1.0 - 1.0 / CR;
-	double ES = 1.0 - 1.0 / ER;
-	double LS = 1.0;
+		// --- Ring Buffer Write ---
+		bufferL[writeIndex] = left;
+		bufferR[writeIndex] = right;
 
-	// level measurement:
-	double peak = this->peak(stereo, ATp, RT);
-	double rms  = this->rms(stereo);
+		// --- Ring Buffer Read (Lookahead D) ---
+		// Read from 'D' samples behind the current write head
+		int readIndex = (writeIndex - (int)D) & (BUFFER_SIZE - 1);
 
-	// static curve:
-	double f = this->staticCurve(rms, peak, LT, LS, CS, CT, CR, NT, ET, ES, ER, knee);
+		float pastL = bufferL[readIndex];
+		float pastR = bufferR[readIndex];
 
-	// smoothing filter:
-	double k = 0.0;
-	if (f_prev - f > 0.0 && attack) {
-		hysteresis += 1;
-	} else if (f_prev - f > 0.0 && !attack) {
-		hysteresis = 0;
-	} else if (f_prev - f <= 0.0 && !attack) {
-		hysteresis += 1;
-	} else if (f_prev - f <= 0.0 && attack) {
-		hysteresis = 0;
-	}
-	if (hysteresis > hyst_max && attack) {
-		hysteresis = 0;
-		attack = false;
-	} else if (hysteresis > hyst_max && !attack) {
-		hysteresis = 0;
-		attack = true;
-	}
-	if (attack) {
-		if (limiter) {
-			k = ATp;
-		} else {
-			k = AT;
+		// Increment & Wrap
+		writeIndex++;
+		if (writeIndex >= BUFFER_SIZE) writeIndex = 0;
+
+		double stereo = std::max(std::abs(left), std::abs(right));
+
+		if (inputs[SIDE_LEFT_INPUT].isConnected() || inputs[SIDE_RIGHT_INPUT].isConnected()) {
+			stereo = std::max(std::abs(inputs[SIDE_LEFT_INPUT].getVoltage()), std::abs(inputs[SIDE_RIGHT_INPUT].getVoltage()));
 		}
-	} else {
-		k = RT;
+
+		double knee = params[KNEE_PARAM].getValue();//dB
+
+		// some values:
+
+		double CS = 1.0 - 1.0 / CR;
+		double ES = 1.0 - 1.0 / ER;
+		double LS = 1.0;
+
+		// level measurement:
+		double peak = this->peak(stereo, ATp, RT);
+		double rms  = this->rms(stereo);
+
+		double f = this->staticCurve(rms, peak, LT, LS, CS, CT, CR, NT, ET, ES, ER, knee);
+
+		bool signalWantsAttack = (f < g_prev);
+
+		double k = 0.0;
+		bool noisegateActive = lights[A].value > 0.0f;
+		if (noisegateActive) {
+			// Force Release time so it fades out smoothly
+			k = RT;
+		} else if (noisegateActive_prev) {
+			// We just switched from noisegate to Audio.
+			// Force attack time so it opens instantly
+			k = ATn;
+		} else {
+			attack = signalWantsAttack;
+			if (attack) {
+				if (limiter) {
+					k = ATp;
+				} else {
+					k = AT;
+				}
+			} else {
+				if (f > g_prev * 1.005f) {
+					k = RT;
+				} else {
+					k = 0.0f;
+				}
+			}
+		}
+
+		double g = this->smooth(k, g_prev, f);
+
+		// apply gain:
+		float processedL = pastL * g;
+		float processedR = pastR * g;
+		if (!std::isfinite(processedL) || !std::isfinite(processedR)) {
+			processedL = 0.0;
+			processedR = 0.0;
+			peak_prev = 1.0;
+			peak = 1.0;
+			rms2_prev = 1.0;
+			g_prev = 1.0;
+			f_prev = 1.0;
+			g = 1.0;
+			f = 1.0;
+		}
+		processedL *= makeupGain;
+		processedL = clamp(processedL, -12.0f, 12.0f);
+		processedR *= makeupGain;
+		processedR = clamp(processedR, -12.0f, 12.0f);
+
+		outBufL[i] = processedL;
+		outBufR[i] = processedR;
+
+		f_prev = f;
+		g_prev = g;
+		peak_prev = peak;
+		noisegateActive_prev = noisegateActive;
 	}
 
-	double g = this->smooth(k, g_prev, f);
+	// Downsample
+	float outL = decimator[0].process(outBufL);
+	float outR = decimator[1].process(outBufR);
 
-	//outputs[DB].setVoltage(g);
-
-	// apply gain:
-	float outL = pastL * g;
-	float outR = pastR * g;
-	if (!std::isfinite(outL) || !std::isfinite(outR)) {
-		outL = 0.0;
-		outR = 0.0;
-		peak_prev = 1.0;
-		peak = 1.0;
-		rms2_prev = 1.0;
-		g_prev = 1.0;
-		f_prev = 1.0;
-		g = 1.0;
-		f = 1.0;
-	}
-	outL *= makeupGain;
-	outL = non_lin_func(outL / 12.0f) * 12.0f;
 	outputs[LEFT_OUTPUT].setVoltage(outL);
-	outR *= makeupGain;
-	outR = non_lin_func(outR / 12.0f) * 12.0f;
 	outputs[RIGHT_OUTPUT].setVoltage(outR);
 
-
 	// VU meters
-	vuMeterIn.process(args.sampleTime, pastL * 0.1f);
-	vuMeterIn2.process(args.sampleTime, pastR * 0.1f);
+	vuMeterIn.process(args.sampleTime, leftInput * 0.1f);
+	vuMeterIn2.process(args.sampleTime, rightInput * 0.1f);
 	vuMeterOut.process(args.sampleTime, outL * 0.1f);
 	vuMeterOut2.process(args.sampleTime, outR * 0.1f);
 	for (int v = 0; step == 512 && v < 15; v++) {
-		lights[VU_IN_LEFT_LIGHT + 14 - v].setBrightness(vuMeterIn.getBrightness(-intervalDB * (v + 1), -intervalDB * v));
-		lights[VU_IN_RIGHT_LIGHT + 14 - v].setBrightness(vuMeterIn2.getBrightness(-intervalDB * (v + 1), -intervalDB * v));
-		lights[VU_OUT_LEFT_LIGHT + 14 - v].setBrightness(vuMeterOut.getBrightness(-intervalDB * (v + 1), -intervalDB * v));
-		lights[VU_OUT_RIGHT_LIGHT + 14 - v].setBrightness(vuMeterOut2.getBrightness(-intervalDB * (v + 1), -intervalDB * v));
+		float upper = -intervalDB * v;
+		float lower = -intervalDB * (v + 1.0f);
+		lights[VU_IN_LEFT_LIGHT + 14 - v].setBrightness(vuMeterIn.getBrightness(lower, upper));
+		lights[VU_IN_RIGHT_LIGHT + 14 - v].setBrightness(vuMeterIn2.getBrightness(lower, upper));
+		lights[VU_OUT_LEFT_LIGHT + 14 - v].setBrightness(vuMeterOut.getBrightness(lower, upper));
+		lights[VU_OUT_RIGHT_LIGHT + 14 - v].setBrightness(vuMeterOut2.getBrightness(lower, upper));
 	}
 	if (step == 512) {
 		step = 0;
 	}
 
 	// set previous values for next step:
-	peak_prev = peak;
-	g_prev = g;
-	f_prev = f;
+
+
 }
 
 double Zod::toExp10(double x, double min, double max) {
@@ -467,45 +517,54 @@ double Zod::staticCurve(double rms, double peak, double LT, double LS, double CS
 	double peak_dB = this->toDB(peak);
 	double G = 0.0;
 
-	lights[A].value  = 0.0;
-	lights[B].value  = 0.0;
-	lights[C].value  = 0.0;
-	lights[DD].value = 0.0;
-	lights[E].value  = 0.0;
+	lights[A].value  = 0.0f;
+	lights[B].value  = 0.0f;
+	lights[C].value  = 0.0f;
+	lights[DD].value = 0.0f;
+	lights[E].value  = 0.0f;
+
+	bool noisegate_active = (NT > THRESHOLD_LIMIT_LOW_DB + 0.001);
+	double x_dB = this->toDB(sqrt(rms));
+	if (noisegate_active && x_dB < NT) {// hard knee:
+		// noise gate
+		lights[A].value = 1.0f;
+		return 0.0;
+	}
 	if (peak_dB > LT) {// hard knee:
 		// limiter
-		G = (peak_dB - LT) * (-LS) - CS * (LT - CT);
-		lights[E].value = 1.0;
+		double comp_offset = 0.0;
+		if (LT > CT) {
+			comp_offset = -CS * (LT - CT);
+		}
+
+		G = (peak_dB - LT) * (-LS) + comp_offset;
+		lights[E].value = 1.0f;
 		limiter = true;
 	} else {
-		double x_dB = this->toDB(sqrt(rms));
+
 		double CTknee = CT - knee * 0.5;
 		double ETknee = ET - knee * 0.5;
-		if (x_dB < NT) {// hard knee:
-			// noise gate
-			lights[A].value = 1.0;
-			return 0.0;
-		} else if (x_dB < ETknee) {
+		if (x_dB < ETknee) {
 			// full expander
 			G = (x_dB - ET) * (-ES);
-			lights[B].value = 1.0;
+			lights[B].value = 1.0f;
 		} else if (x_dB < ETknee + knee) {
 			// semi expander
 			G = -(1.0 / ER - 1.0) * pow(x_dB - ET - knee * 0.5, 2.0) / (2.0 * knee);
-			lights[B].value = 0.5;
-			lights[C].value = 0.5;
+			lights[B].value = 0.5f;
+			lights[C].value = 0.5f;
 		} else if (x_dB < CTknee) {
 			// neutral
-			lights[C].value = 1.0;
+			lights[C].value = 1.0f;
 			G = 0.0;
 		} else if (knee > 0.0 && x_dB < CTknee + knee) {
 			// semi compressor
-			lights[DD].value = 0.5;
-			lights[C].value  = 0.5;
+			lights[DD].value = 0.5f;
+			lights[C].value  = 0.5f;
 			G = (1.0 / CR - 1.0) * pow(x_dB - CT + knee * 0.5, 2.0) / (2.0 * knee);
 		} else {
 			// full compressor
-			lights[DD].value = 1.0;
+			lights[DD].value = 1.0f;
 			G = (x_dB - CT) * (-CS);
 		}
 		// n | e | 1 | c | l
@@ -514,6 +573,7 @@ double Zod::staticCurve(double rms, double peak, double LT, double LS, double CS
 }
 
 double Zod::rms(double x) {
+	// note that this method is missing sqrt(), thats on purpose, we do that outside it.
 	double rms2 = (1.0 - TAV) * rms2_prev + TAV * x * x;
 	rms2_prev = rms2;
 	return rms2;
@@ -532,7 +592,10 @@ double Zod::smooth(double k, double g_prev, double f) {
 }
 
 double Zod::toDB(double volt) {
-	return 20.0 * log10(volt / 5.0);
+	// Safety Check. Prevent log10(0) or log10(negative).
+	// 0.000001 is -134dB, which is effectively silence in 32-bit float.
+	double v = std::max(std::abs(volt), 0.000001);
+	return 20.0 * log10(v / 5.0);
 }
 
 double Zod::toGain(double dB) {

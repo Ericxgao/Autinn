@@ -21,7 +21,12 @@
 
 **/
 
-static const int oversample = 4;
+static constexpr int oversample = 4;
+
+static constexpr int TABLE_SIZE = 2048; // Power of 2 is best
+static float lutSawLow[TABLE_SIZE + 1];
+static float lutSawHigh[TABLE_SIZE + 1];
+static bool lutInitialized = false;
 
 struct Saw : Module {
 	enum ParamIds {
@@ -41,7 +46,7 @@ struct Saw : Module {
 		NUM_LIGHTS
 	};
 
-	float phase = 0;
+	float phase[16] = {};
 	float blinkTime = 0;
 
 /* experimental cleaner dataset
@@ -241,13 +246,28 @@ struct Saw : Module {
 
 	float lowHigh [2] = {20.0f,100.0f};// use the low waveform at 20 hz, the high at 100 Hz.
 
-	dsp::Decimator<oversample, 8> decimator = dsp::Decimator<oversample, 8>(0.9f);
-	
+	dsp::Decimator<oversample, 8> decimator[16];
+
+
 	Saw() {
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
 		configParam(Saw::PITCH_PARAM, -4.0f, 4.0f, 0.0f, "Frequency"," Hz", 2.0f, dsp::FREQ_C4);
 		configInput(PITCH_INPUT, "1V/Oct CV");
 		configOutput(BUZZ_OUTPUT, "Audio");
+
+		if (!lutInitialized) {
+			for (int i = 0; i <= TABLE_SIZE; i++) {
+				// (float)i ensures we get 0.0 to 1.0, not just 0
+				float p = (float)i / (float)TABLE_SIZE;
+				lutSawLow[i]  = this->lut(szLow,  sawInLow,  sawOutLow,  p);
+				lutSawHigh[i] = this->lut(szHigh, sawInHigh, sawOutHigh, p);
+			}
+			lutInitialized = true;
+		}
+
+		for (int c = 0; c < 16; c++) {
+			decimator[c] = dsp::Decimator<oversample, 8>(0.9f);
+		}
 	}
 
 	float lut (int size, float in [], float out [], float test);
@@ -294,45 +314,76 @@ void Saw::process(const ProcessArgs &args) {
 		return;
 	}
 
-	float deltaTime = args.sampleTime/oversample;
 
-	float pitch = params[PITCH_PARAM].getValue();
-	pitch += inputs[PITCH_INPUT].getVoltage();
-	pitch = clamp(pitch, -4.0f, 5.0f);
-	float freq = dsp::FREQ_C4 * powf(2.0f, pitch);
+	int channels = std::max(1, inputs[PITCH_INPUT].getChannels());
+	outputs[BUZZ_OUTPUT].setChannels(channels);
 
-	float period = 1.0f;
-	float deltaPhase = freq * deltaTime * period;
-	
-	float outBuf  [oversample];
-	
-	for (int i = 0; i < oversample; i++) {
-		phase += deltaPhase;
-		phase = fmod(phase, period);
+	float pitchBase = params[PITCH_PARAM].getValue();
 
-		// Use the Look-up Table to read the output value
-		float buzzL = this->lut(szLow, sawInLow, sawOutLow, phase);
-		float buzzH = this->lut(szHigh, sawInHigh, sawOutHigh, phase);
-	//	float lowHighValues [2] = {buzzL,buzzH};
-	//	float buzz = this->lut(2, lowHigh, lowHighValues, freq);
-		float out = 0.0f;
+	float deltaTime = args.sampleTime / oversample;
+
+	int pitchInputChannels = inputs[PITCH_INPUT].getChannels();
+
+	for (int c = 0; c < channels; c++) {
+		float pitch = pitchBase + (pitchInputChannels>c?inputs[PITCH_INPUT].getPolyVoltage(c):inputs[PITCH_INPUT].getVoltage());
+		pitch = clamp(pitch, -4.0f, 5.0f);
+		//float freq = dsp::FREQ_C4 * powf(2.0f, pitch);
+		float freq = dsp::FREQ_C4 * std::exp2f(pitch);//faster
+
+		float deltaPhase = freq * deltaTime;
+
+		int mode = 0; // 0: Low, 1: High, 2: Blend
+		float blend = 0.0f;
+		float mean = 0.0f;
+
 		if (freq < lowHigh[0]) {
-			out = (buzzL-meanLow);
+			mode = 0;
 		} else if (freq > lowHigh[1]) {
-			out = (buzzH-meanHigh);
+			mode = 1;
 		} else {
-			float buzz = this->range(freq, lowHigh[0], lowHigh[1], buzzL, buzzH);
-			float mean = this->range(freq, lowHigh[0], lowHigh[1], meanLow, meanHigh);
-			out = (buzz-mean);
+			mode = 2;
+			blend = (freq - lowHigh[0]) / (lowHigh[1] - lowHigh[0]);
+			mean = interpolator(blend, meanLow, meanHigh);
 		}
-		outBuf[i] = out;
-	}
-	outputs[BUZZ_OUTPUT].setVoltage(decimator.process(outBuf) * 1.666f);// keep its peaks within approx +-5V.
 
-	blinkTime += args.sampleTime;
-	float blinkPeriod = 1.0f/(freq*0.01f);
-	blinkTime = fmod(blinkTime, blinkPeriod);
-	lights[BLINK_LIGHT].value = (blinkTime < blinkPeriod*0.5f) ? 1.0 : 0.0;
+		float outBuf  [oversample];
+
+		for (int i = 0; i < oversample; i++) {
+			phase[c] += deltaPhase;
+
+			if (phase[c] >= 1.0f) phase[c] -= 1.0f;
+
+			float p = phase[c] * TABLE_SIZE;
+			int idx = (int)p;
+			float frac = p - idx;
+
+			float out = 0.0f;
+			if (mode == 0) {
+				float buzzL = interpolator(frac, lutSawLow[idx], lutSawLow[idx + 1]);
+				out = (buzzL - meanLow);
+			} else if (mode == 1) {
+				float buzzH = interpolator(frac, lutSawHigh[idx], lutSawHigh[idx + 1]);
+				out = (buzzH - meanHigh);
+			} else {
+				float buzzL = interpolator(frac, lutSawLow[idx], lutSawLow[idx + 1]);
+				float buzzH = interpolator(frac, lutSawHigh[idx], lutSawHigh[idx + 1]);
+				float buzz = interpolator(blend, buzzL, buzzH);
+				out = (buzz - mean);
+			}
+			outBuf[i] = out;
+		}
+		outputs[BUZZ_OUTPUT].setVoltage(decimator[c].process(outBuf) * 1.666f, c);// keep its peaks within approx +-5V.
+
+		if (c == 0) {
+			blinkTime += args.sampleTime;
+			float blinkPeriod = 1.0f/(freq*0.01f);
+			//blinkTime = fmod(blinkTime, blinkPeriod);
+			if (blinkTime >= blinkPeriod) {
+				blinkTime -= blinkPeriod;
+			}
+			lights[BLINK_LIGHT].value = (blinkTime < blinkPeriod*0.5f) ? 1.0 : 0.0;
+		}
+	}
 }
 
 struct SawWidget : ModuleWidget {

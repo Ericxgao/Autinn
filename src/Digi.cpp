@@ -41,18 +41,21 @@ struct Digi : Module {
 	enum LightIds {
 		NUM_LIGHTS
 	};
-	
-	dsp::Upsampler<oversample, 8> upsampler = dsp::Upsampler<oversample, 8>(0.9f);
-	dsp::Decimator<oversample, 8> decimator = dsp::Decimator<oversample, 8>(0.9f);
+
+	std::vector<dsp::Upsampler<oversample, 8>> upsamplers;
+	std::vector<dsp::Decimator<oversample, 8>> decimators;
 
 	Digi() {
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
-		configParam(Digi::STEP_PARAM, 0.0f, 1.0f, 0.0f, "Quantization", " Volt",0.0f,1.0f);
-		configParam(Digi::CV_PARAM, 0.0f, 0.2f, 0.0f, "CV", "%",0.0f,500.0f);
+		configParam<Param3Digits>(Digi::STEP_PARAM, 0.0f, 1.0f, 0.0f, "Quantization", " Volt",0.0f,1.0f);
+		configParam<Param4Digits>(Digi::CV_PARAM, 0.0f, 0.2f, 0.0f, "CV", "%",0.0f,500.0f);
 		configBypass(ANALOG_INPUT, DIGITAL_OUTPUT);
 		configInput(CV_INPUT, "CV");
 		configInput(ANALOG_INPUT, "Analog");
 		configOutput(DIGITAL_OUTPUT, "Digital");
+
+		upsamplers.assign(16, dsp::Upsampler<oversample, 8>(0.9f));
+		decimators.assign(16, dsp::Decimator<oversample, 8>(0.9f));
 	}
 
 	void process(const ProcessArgs &args) override;
@@ -65,34 +68,33 @@ void Digi::process(const ProcessArgs &args) {
 	if (!outputs[DIGITAL_OUTPUT].isConnected()) {
 		return;
 	}
-	float input = inputs[ANALOG_INPUT].getVoltage();
-	float jump = clamp(params[STEP_PARAM].getValue()+params[CV_PARAM].getValue()*inputs[CV_INPUT].getVoltage(),0.0f,1.0f);
-	
-	/*	if (jump == 0.0f) {
-		outputs[DIGITAL_OUTPUT].setVoltage(input);
-		return;
-	}*/
-	
-	float inBuf   [oversample];
-	float outBuf  [oversample];
-	
-	upsampler.process(input, inBuf);
-	
-	for (int i = 0; i < oversample; i++) {
-		float analog  = inBuf[i];
-		float digital = 0.0f;
-		if (jump == 0.0f) {
-			digital = analog;
-		} else if (analog >= 0.0f) {
-			digital = analog-fmod(analog, jump);
-		} else {
-			analog = -analog;
-			digital = analog+(jump-fmod(analog, jump));//fmod return same sign as input value
-			digital = -digital;
+
+	int channels = std::max(1, inputs[ANALOG_INPUT].getChannels());
+	outputs[DIGITAL_OUTPUT].setChannels(channels);
+
+	for (int c = 0; c < channels; c++) {
+		float input = inputs[ANALOG_INPUT].getPolyVoltage(c);
+		float jump = clamp(params[STEP_PARAM].getValue()+params[CV_PARAM].getValue()*inputs[CV_INPUT].getVoltage(),0.0f,1.0f);
+
+		float inBuf   [oversample];
+		float outBuf  [oversample];
+
+		upsamplers[c].process(input, inBuf);
+
+		for (int i = 0; i < oversample; i++) {
+			float analog  = inBuf[i];
+			float digital = 0.0f;
+			if (jump > 0.001f) {
+				// "floor" creates the step.
+				// Adding 0.5f * jump aligns it to the center
+				digital = std::floor(analog / jump) * jump + (0.5f * jump);
+			} else {
+				digital = analog;
+			}
+			outBuf[i] = digital;
 		}
-		outBuf[i] = digital + 0.5f*jump;
+		outputs[DIGITAL_OUTPUT].setVoltage(decimators[c].process(outBuf), c);
 	}
-    outputs[DIGITAL_OUTPUT].setVoltage(decimator.process(outBuf));
 }
 
 struct DigiWidget : ModuleWidget {
@@ -105,7 +107,13 @@ struct DigiWidget : ModuleWidget {
 		//addChild(createWidget<ScrewStarAutinn>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
 		//addChild(createWidget<ScrewStarAutinn>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 
-		addParam(createParam<RoundMediumAutinnKnob>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_KNOB_MED, 75), module, Digi::STEP_PARAM));
+		//addParam(createParam<RoundMediumAutinnKnob>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_KNOB_MED, 75), module, Digi::STEP_PARAM));
+		auto stepKnob = createParam<AutinnArcMidKnob>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_KNOB_MED, 75), module, Digi::STEP_PARAM);
+		stepKnob->setModulation(Digi::CV_INPUT, [](float cv, float val, float att) {
+					return clamp(val + cv*att, 0.0f, 1.0f);
+				}, Digi::CV_PARAM);
+		addParam(stepKnob);
+
 		addInput(createInput<InPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_PORT, 140), module, Digi::CV_INPUT));
 		addParam(createParam<RoundSmallAutinnKnob>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_KNOB_SMALL, 175), module, Digi::CV_PARAM));
 

@@ -26,6 +26,42 @@
 #define NUM_CHORDS 14
 #define NUM_FINGERS 4
 
+static const char* chordNames[NUM_CHORDS] = {
+	"Major Triad",
+	"Minor Triad",
+	"Augmented Triad",
+	"Diminished Triad",
+	"Power",
+	"Augmented Power",
+	"Diminished Power",
+	"Major Triad Inverted",
+	"Minor Triad Inverted",
+	"Augmented Triad Inverted",
+	"Diminished Triad Inverted",
+	"Minor 7th",
+//  "Major 7th",
+	"Dominant 7th",
+	"Diminished 7th",
+};
+
+static const int chords[NUM_CHORDS][4] = {
+	{0,4,7,NOT_PLAYING},          // Major Triad
+	{0,3,7,NOT_PLAYING},          // Minor Triad
+	{0,4,8,NOT_PLAYING},          // Aug Triad
+	{0,3,6,NOT_PLAYING},          // Dim Triad
+	{0,7,NOT_PLAYING,NOT_PLAYING},// Power
+	{0,8,NOT_PLAYING,NOT_PLAYING},// Aug Power
+	{0,6,NOT_PLAYING,NOT_PLAYING},// Dim Power
+	{0,-8,-5,NOT_PLAYING},        // Major Triad 1st inv
+	{0,-9,-5,NOT_PLAYING},        // Minor Triad 1st inv
+	{0,-8,-4,NOT_PLAYING},        // Aug Triad 1st inv
+	{0,-9,-6,NOT_PLAYING},        // Dim Triad 1st inv
+	{0,3,7,10},                   // Minor 7th
+	//{0,4,7,11},                 // Major 7th (too dissonant)
+	{0,4,7,10},                   // Dominant 7th
+	{0,3,6, 9},                   // Diminished 7th
+};
+
 struct Chord : Module {
 	enum ParamIds {
 		//DIAL_PARAM,
@@ -57,43 +93,11 @@ struct Chord : Module {
 		for (int light = 0; light < NUM_CHORDS; light++) {
 			configLight(CHORD_LIGHT+light, chordNames[light]);
 		}
+
+		for (int i = 0; i < NUM_CHORDS; i++) {
+			lights[CHORD_LIGHT + i].setBrightness(i == chordIndex ? 1.0f : 0.0f);
+		}
 	}
-
-	std::string chordNames[NUM_CHORDS] = {
-		"Major Triad",
-		"Minor Triad",
-		"Augmented Triad",
-		"Diminished Triad",
-		"Power",
-		"Augmented Power",
-		"Diminished Power",
-		"Major Triad Inverted",
-		"Minor Triad Inverted",
-		"Augmented Triad Inverted",
-		"Diminished Triad Inverted",
-		"Minor 7th",
-	//  "Major 7th",
-		"Dominant 7th",
-		"Diminished 7th",
-	};
-
-	int chords[NUM_CHORDS][4] = {
-		{0,4,7,NOT_PLAYING},          // Major Triad
-		{0,3,7,NOT_PLAYING},          // Minor Triad
-		{0,4,8,NOT_PLAYING},          // Aug Triad
-		{0,3,6,NOT_PLAYING},          // Dim Triad
-		{0,7,NOT_PLAYING,NOT_PLAYING},// Power
-		{0,8,NOT_PLAYING,NOT_PLAYING},// Aug Power
-		{0,6,NOT_PLAYING,NOT_PLAYING},// Dim Power
-		{0,-8,-5,NOT_PLAYING},        // Major Triad 1st inv
-		{0,-9,-5,NOT_PLAYING},        // Minor Triad 1st inv
-		{0,-8,-4,NOT_PLAYING},        // Aug Triad 1st inv
-		{0,-9,-6,NOT_PLAYING},        // Dim Triad 1st inv
-		{0,3,7,10},                   // Minor 7th
-		//{0,4,7,11},                 // Major 7th (too dissonant)
-		{0,4,7,10},                   // Dominant 7th
-		{0,3,6, 9},                   // Diminished 7th
-	};
 
 	json_t *dataToJson() override {
 		json_t *root = json_object();
@@ -104,12 +108,15 @@ struct Chord : Module {
 	void dataFromJson(json_t *rootJ) override {
 		json_t *ext3 = json_object_get(rootJ, "chordIndex");
 		if (ext3) {
-			chordIndex = json_integer_value(ext3);
+			chordIndex = clamp(json_integer_value(ext3), 0, NUM_CHORDS - 1);
+			for (int i = 0; i < NUM_CHORDS; i++) {
+				lights[CHORD_LIGHT + i].setBrightness(i == chordIndex ? 1.0f : 0.0f);
+			}
 		}
 	}
 
 	float semitone = 1.0f/12.0f;
-	bool trig_prev = false;
+	dsp::SchmittTrigger trigger;
 	int chordIndex = 0;
 
 	void process(const ProcessArgs &args) override;
@@ -119,18 +126,18 @@ void Chord::process(const ProcessArgs &args) {
 	// VCV Rack audio rate is +-5V
 	// VCV Rack CV is +-5V or 0V-10V
 
-	if (!outputs[CHORD_OUTPUT].isConnected() || !outputs[ROOT_INPUT].isConnected()) {
+	if (!outputs[CHORD_OUTPUT].isConnected() || !inputs[ROOT_INPUT].isConnected()) {
 		return;
 	}
 
-	bool trig = inputs[TRIGGER_INPUT].getVoltage() >= 1.0f;
+	if (trigger.process(inputs[TRIGGER_INPUT].getVoltage())) {
+		chordIndex = (int)(random::uniform() * NUM_CHORDS);
+		if (chordIndex >= NUM_CHORDS) chordIndex = NUM_CHORDS - 1;
 
-	if (trig && !trig_prev) {
-		chordIndex = (rand() % static_cast<int>(NUM_CHORDS));
-	}
-
-	for (int light = 0; light < NUM_CHORDS; light++) {
-		lights[CHORD_LIGHT+light].setBrightness(light == chordIndex);
+		// Only update lights when the chord actually changes
+		for (int i = 0; i < NUM_CHORDS; i++) {
+			lights[CHORD_LIGHT + i].setBrightness(i == chordIndex ? 1.0f : 0.0f);
+		}
 	}
 
 	float root = inputs[ROOT_INPUT].getVoltage();
@@ -141,8 +148,6 @@ void Chord::process(const ProcessArgs &args) {
 	    outputs[FINGERS_PLAYING_OUTPUT].setVoltage(chords[chordIndex][finger] == NOT_PLAYING?0.0f:10.0f, finger);
 	    outputs[CHORD_OUTPUT].setVoltage(root+semitone*chords[chordIndex][finger],finger);
 	}
-
-    trig_prev = trig;
 }
 
 struct ChordWidget : ModuleWidget {

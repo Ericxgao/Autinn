@@ -51,7 +51,7 @@ struct Jette : Module {
 		NUM_LIGHTS
 	};
 
-	float phase = 0.0f;
+	float phase[16] = {};
 	float blinkTime = 0.0f;
 	int down = 0;
 	int shape = 0;
@@ -60,14 +60,14 @@ struct Jette : Module {
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
 		configButton(Jette::BUTTON_PARAM, "Toggle waveform");
 		configParam(Jette::PITCH_PARAM, -4.0f, 4.0f, 0.0f, "Frequency"," Hz", 2.0f, dsp::FREQ_C4);
-		configParam(Jette::A_PARAM, 0.0f, 1.0f, 1.0f, "");
-		configParam(Jette::B_PARAM, 0.0f, 1.0f, 1.0f, "");
-		configParam(Jette::C_PARAM, 0.0f, 1.0f, 1.0f, "");
-		configParam(Jette::D_PARAM, 0.0f, 1.0f, 1.0f, "");
-		configParam(Jette::E_PARAM, 0.0f, 1.0f, 1.0f, "");
-		configParam(Jette::F_PARAM, 0.0f, 1.0f, 1.0f, "");
-		configParam(Jette::G_PARAM, 0.0f, 1.0f, 1.0f, "");
-		configParam(Jette::H_PARAM, 0.0f, 1.0f, 1.0f, "");
+		configParam(Jette::A_PARAM, 0.0f, 1.0f, 1.0f, "Fundamental");
+		configParam(Jette::B_PARAM, 0.0f, 1.0f, 1.0f, "Partial 2");
+		configParam(Jette::C_PARAM, 0.0f, 1.0f, 1.0f, "Partial 3");
+		configParam(Jette::D_PARAM, 0.0f, 1.0f, 1.0f, "Partial 4");
+		configParam(Jette::E_PARAM, 0.0f, 1.0f, 1.0f, "Partial 5");
+		configParam(Jette::F_PARAM, 0.0f, 1.0f, 1.0f, "Partial 6");
+		configParam(Jette::G_PARAM, 0.0f, 1.0f, 1.0f, "Partial 7");
+		configParam(Jette::H_PARAM, 0.0f, 1.0f, 1.0f, "Partial 8");
 		configInput(PITCH_INPUT, "1V/Oct CV");
 		configLight(BLINK_LIGHT, "Activity");
 		configLight(SQUARE_LIGHT, "Square Waveform");
@@ -96,7 +96,7 @@ struct Jette : Module {
 
 	void onRandomize(const RandomizeEvent& e) override {
 		Module::onRandomize(e);
-		shape = rand() % static_cast<int>(3);// min + (rand() % static_cast<int>(max - min + 1)) [including min and max]
+		shape = static_cast<int>(random::uniform() * 3.f);// 0,1 or 2
 	}
 
 };
@@ -122,92 +122,138 @@ void Jette::process(const ProcessArgs &args) {
 
 	float dt = args.sampleTime;
 
-	float pitch = params[PITCH_PARAM].getValue();
-	pitch += inputs[PITCH_INPUT].getVoltage();
-	pitch = clamp(pitch, -4.0f, 6.0f);
-	float freq = dsp::FREQ_C4 * powf(2.0f, pitch);
+	int channels = std::max(1, inputs[PITCH_INPUT].getChannels());
+    outputs[BUZZ_OUTPUT].setChannels(channels);
+	
+	float pitchBase = params[PITCH_PARAM].getValue();
 
+	float sliders[8] = {
+		params[A_PARAM].getValue(), params[B_PARAM].getValue(),
+		params[C_PARAM].getValue(), params[D_PARAM].getValue(),
+		params[E_PARAM].getValue(), params[F_PARAM].getValue(),
+		params[G_PARAM].getValue(), params[H_PARAM].getValue()
+	};
+
+	float nyquist = args.sampleRate * 0.5f;
 	float period = 2.0f*M_PI;
-	float deltaPhase = freq * dt * period;
-	phase += deltaPhase;
-	phase = fmod(phase, period);
 
-	float a = params[A_PARAM].getValue();
-	float b = params[B_PARAM].getValue();
-	float c = params[C_PARAM].getValue();
-	float d = params[D_PARAM].getValue();
-	float e = params[E_PARAM].getValue();
-	float f = params[F_PARAM].getValue();
-	float g = params[G_PARAM].getValue();
-	float h = params[H_PARAM].getValue();
+	for (int ch = 0; ch < channels; ch++) {
+		float pitch = pitchBase + inputs[PITCH_INPUT].getPolyVoltage(ch);
+		pitch = clamp(pitch, -4.0f, 6.0f);
+		float freq = dsp::FREQ_C4 * std::exp2f(pitch);
+	
 
-	float nyquist = args.sampleRate*0.5f;
-	if (shape < 2.0f) {
-		if (freq * 15.0f > nyquist) {
-			h = 0.0f;
-			if (freq * 13.0f > nyquist) {
-				g = 0.0f;
-				if (freq * 11.0f > nyquist) {
-					f = 0.0f;
-					if (freq * 9.0f > nyquist) {
-						e = 0.0f;
-						if (freq * 7.0f > nyquist) {
-							d = 0.0f;
-							if (freq * 5.0f > nyquist) {
-								c = 0.0f;
-								if (freq * 3.0f > nyquist) {
-									b = 0.0f;
-								}
-							}
-						}
+		float deltaPhase = freq * dt * period;
+		phase[ch] += deltaPhase;
+		//phase[ch] = fmod(phase[ch], period);
+		if (phase[ch] >= period) phase[ch] -= period; // Faster than fmod
+
+		float buzz = 0.0f;
+		float p = phase[ch];
+
+		// --- Chebyshev Recursion ---
+		if (shape == 0) { // SQUARE
+			float s1 = sinf(p);
+			float c1 = cosf(p);
+
+			float val_curr = s1;
+			float val_prev = 0.0f; // sin(0)
+
+			// 1st Harmonic (Slider A)
+			if (freq < nyquist) buzz += sliders[0] * val_curr;
+
+			float two_c1 = 2.0f * c1;
+			for (int k = 2; k <= 15; k++) {
+				float val_next = two_c1 * val_curr - val_prev;
+				val_prev = val_curr;
+				val_curr = val_next;
+
+				if (k % 2 != 0) { // Odd harmonics only
+					float harmonicFreq = freq * (float)k;
+					float amp = 1.0f;
+					if (harmonicFreq >= nyquist) {
+						break;
+					} else if (harmonicFreq > (nyquist - 2000.0f)) {
+						// Fade out in the top 2000Hz
+						amp = (nyquist - harmonicFreq) / 2000.0f;
 					}
+
+					int sliderIdx = (k - 1) / 2;
+					buzz += amp * sliders[sliderIdx] * val_curr / (float)k;
 				}
 			}
-		}
-	} else {
-		if (freq * 8.0f > nyquist) {
-			h = 0.0f;
-			if (freq * 7.0f > nyquist) {
-				g = 0.0f;
-				if (freq * 6.0f > nyquist) {
-					f = 0.0f;
-					if (freq * 5.0f > nyquist) {
-						e = 0.0f;
-						if (freq * 4.0f > nyquist) {
-							d = 0.0f;
-							if (freq * 3.0f > nyquist) {
-								c = 0.0f;
-								if (freq * 2.0f > nyquist) {
-									b = 0.0f;
-								}
-							}
-						}
+			buzz *= 20.0f / M_PI;
+		} else if (shape == 1) { // TRIANGLE
+			float c1 = cos(p);
+
+			float val_curr = c1;
+			float val_prev = 1.0f; // cos(0)
+
+			// 1st Harmonic
+			if (freq < nyquist) buzz += sliders[0] * val_curr;
+
+			float two_c1 = 2.0f * c1;
+			for (int k = 2; k <= 15; k++) {
+				float val_next = two_c1 * val_curr - val_prev;
+				val_prev = val_curr;
+				val_curr = val_next;
+
+				if (k % 2 != 0) { // Odd harmonics only
+					float harmonicFreq = freq * (float)k;
+					float amp = 1.0f;
+					if (harmonicFreq >= nyquist) {
+						break;
+					} else if (harmonicFreq > (nyquist - 2000.0f)) {
+						// Fade out in the top 2000Hz
+						amp = (nyquist - harmonicFreq) / 2000.0f;
 					}
+
+					int sliderIdx = (k - 1) / 2;
+					float div = (float)(k * k); // Falls off as 1/k^2
+					buzz += amp * sliders[sliderIdx] * val_curr / div;
 				}
 			}
+			buzz *= 40.0f / (M_PI * M_PI);
+
+		} else { // SAW
+			float s1 = sin(p);
+			float c1 = cos(p);
+
+			float val_curr = s1;
+			float val_prev = 0.0f;
+
+			// 1st Harmonic
+			if (freq < nyquist) buzz += sliders[0] * val_curr;
+
+			float two_c1 = 2.0f * c1;
+			for (int k = 2; k <= 8; k++) {
+				float val_next = two_c1 * val_curr - val_prev;
+				val_prev = val_curr;
+				val_curr = val_next;
+
+				float harmonicFreq = freq * (float)k;
+				float amp = 1.0f;
+				if (harmonicFreq >= nyquist) {
+					break;
+				} else if (harmonicFreq > (nyquist - 2000.0f)) {
+					// Fade out in the top 2000Hz
+					amp = (nyquist - harmonicFreq) / 2000.0f;
+				}
+
+				float sign = (k % 2 == 0) ? -1.0f : 1.0f; // Alternating signs
+				buzz += amp * sign * sliders[k-1] * val_curr / (float)k;
+			}
+			buzz *= 10.0f / M_PI;
+		}
+		outputs[BUZZ_OUTPUT].setVoltage(buzz, ch);//approx 10V PP
+
+		if (ch == 0) {
+			blinkTime += dt;
+			float blinkPeriod = 1.0f/(freq*0.01f);
+			blinkTime = fmod(blinkTime, blinkPeriod);
+			lights[BLINK_LIGHT].value = (blinkTime < blinkPeriod*0.5f) ? 1.0 : 0.0;
 		}
 	}
-	float buzz = 0.0f;
-	if (shape == 0) {
-		// square
-		buzz = a*sin(phase) + b*sin(3.0f*phase)/3.0f + c*sin(5.0f*phase)/5.0f + d*sin(7.0f*phase)/7.0f + e*sin(9.0f*phase)/9.0f + f*sin(11.0f*phase)/11.0f + g*sin(13.0f*phase)/13.0f + h*sin(15.0f*phase)/15.0f;
-		buzz *= 20.0f/M_PI;
-	} else if (shape == 1 ) {
-		// triangle
-		buzz = a*cos(phase) + b*cos(3.0f*phase)/9.0f + c*cos(5.0f*phase)/25.0f + d*cos(7.0f*phase)/49.0f + e*cos(9.0f*phase)/81.0f + f*cos(11.0f*phase)/121.0f + g*cos(13.0f*phase)/169.0f + h*cos(15.0f*phase)/225.0f;
-		buzz *= 40.0f/(M_PI*M_PI);
-	} else {
-		// saw
-		buzz = a*sin(phase) - b*sin(2.0f*phase)/2.0f + c*sin(3.0f*phase)/3.0f - d*sin(4.0f*phase)/4.0f + e*sin(5.0f*phase)/5.0f - f*sin(6.0f*phase)/6.0f + g*sin(7.0f*phase)/7.0f - h*sin(8.0f*phase)/8.0f;
-		// + sin(9*phase)/9 - sin(10*phase)/10 + sin(11*phase)/11 - sin(12*phase)/12 + sin(13*phase)/13 - sin(14*phase)/14;
-		buzz *= 10.0f/M_PI;
-	}
-	outputs[BUZZ_OUTPUT].setVoltage(buzz);//aprox 10V PP 
-
-	blinkTime += dt;
-	float blinkPeriod = 1.0f/(freq*0.01f);
-	blinkTime = fmod(blinkTime, blinkPeriod);
-	lights[BLINK_LIGHT].value = (blinkTime < blinkPeriod*0.5f) ? 1.0 : 0.0;
 }
 
 struct JetteWidget : ModuleWidget {

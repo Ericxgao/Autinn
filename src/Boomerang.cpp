@@ -1,5 +1,4 @@
 #include "Autinn.hpp"
-#include <cmath>
 
 /*
 
@@ -43,13 +42,14 @@ struct Boomerang : Module {
 
 	Boomerang() {
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
-		configParam(Boomerang::DIAL_PARAM, 0.001f, 2.0f, 1.0f, "Gain", " dB", -10, 20);
+		configParam<Param3Digits>(Boomerang::DIAL_PARAM, 0.001f, 2.0f, 1.0f, "Gain", " dB", -10, 20);
 		configBypass(PRE_INPUT, PRE_OUTPUT);
 		configBypass(POST_INPUT, POST_OUTPUT);
 		configInput(PRE_INPUT, "Pre");
 		configInput(POST_INPUT, "Post");
 		configOutput(PRE_OUTPUT, "Pre");
 		configOutput(POST_OUTPUT, "Post");
+		configInput(CV_INPUT, "CV");
 	}
 
 	void process(const ProcessArgs &args) override;
@@ -86,14 +86,14 @@ struct BoomerangWidget : ModuleWidget {
 		addChild(createWidget<ScrewStarAutinn>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 		//addChild(createWidget<ScrewStarAutinn>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 		
-		addInput(createInput<InPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_PORT, 65), module, Boomerang::CV_INPUT));
-		addParam(createParam<RoundMediumAutinnKnob>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_KNOB_MED, 100), module, Boomerang::DIAL_PARAM));
+		addInput(createInput<InPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5f-HALF_PORT, 65), module, Boomerang::CV_INPUT));
+		addParam(createParam<RoundMediumAutinnKnob>(Vec(3 * RACK_GRID_WIDTH*0.5f-HALF_KNOB_MED, 100), module, Boomerang::DIAL_PARAM));
 
-		addInput(createInput<InPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_PORT, 150), module, Boomerang::PRE_INPUT));
-		addOutput(createOutput<OutPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_PORT, 200), module, Boomerang::PRE_OUTPUT));
+		addInput(createInput<InPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5f-HALF_PORT, 150), module, Boomerang::PRE_INPUT));
+		addOutput(createOutput<OutPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5f-HALF_PORT, 200), module, Boomerang::PRE_OUTPUT));
 
-		addInput(createInput<InPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_PORT, 250), module, Boomerang::POST_INPUT));
-		addOutput(createOutput<OutPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5-HALF_PORT, 300), module, Boomerang::POST_OUTPUT));
+		addInput(createInput<InPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5f-HALF_PORT, 250), module, Boomerang::POST_INPUT));
+		addOutput(createOutput<OutPortAutinn>(Vec(3 * RACK_GRID_WIDTH*0.5f-HALF_PORT, 300), module, Boomerang::POST_OUTPUT));
 	}
 };
 

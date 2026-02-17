@@ -1,8 +1,5 @@
 #include "Autinn.hpp"
 #include <cmath>
-#include <queue>
-
-using std::queue;
 /*
 
     Autinn VCV Rack Plugin
@@ -23,7 +20,7 @@ using std::queue;
 
 **/
 
-#define HYSTERESIS_TIME_SEC               0.0003
+//#define HYSTERESIS_TIME_SEC               0.001
 //#define THRESHOLD_DEFAULT_NOISEGATE_DB  -70.0
 //#define THRESHOLD_DEFAULT_EXPANDER_DB   -60.0
 //#define THRESHOLD_DEFAULT_COMPRESSOR_DB  -6.0
@@ -33,7 +30,7 @@ using std::queue;
 //#define ATTACK_LOW_MS                     1.0//was 0.16
 //#define ATTACK_HIGH_MS                 2600.0
 #define ATTACK_LIMITER_LOW_MS             0.02
-#define ATTACK_LIMITER_HIGH_MS           10.0
+#define ATTACK_LIMITER_HIGH_MS            2.0
 #define RELEASE_LOW_MS                    1.0
 #define RELEASE_HIGH_MS                5000.0
 //#define RMS_TIME_LOW_MS                   1.0
@@ -45,6 +42,7 @@ using std::queue;
 //#define KNEE_DEFAULT_DB                   5.0
 #define MAKEUP_GAIN_MAX                  10.0//20dB
 //#define SMOOTH_FILTER_POLE_SLEW         1000.0
+#define LOOKAHEAD_MS                      4.0// must be bigger than ATTACK_LIMITER_HIGH_MS
 
 struct Non : Module {
 	enum ParamIds {
@@ -102,9 +100,12 @@ struct Non : Module {
 	bool attack = true;
 	bool limiter = false;
 
+	// Buffer size for safety with 4x oversampling
+	static const int BUFFER_SIZE = 65536;//since lookahead is 15 ms
 	unsigned D = 2;
-	queue <float> bufferL;
-	queue <float> bufferR;
+	float bufferL[BUFFER_SIZE] = {};
+	float bufferR[BUFFER_SIZE] = {};
+	int writeIndex = 0;
 
 	// these are here to optimize so not to do expensive ops every step:
 	//double ta = -150.0;
@@ -120,6 +121,7 @@ struct Non : Module {
 	//double tavKnob = -150.0;
 	double gainKnob = 0.0;
 	double makeupGain = 1.0;
+	double LT = THRESHOLD_DEFAULT_LIMITER_DB;
 	double rate   = 0.0;
 	double RT = 0.1;
 	//double AT = 0.1;
@@ -127,6 +129,12 @@ struct Non : Module {
 	//double TAV = 0.03;
 	//double k_prev = 1.0 - exp(-2.2 * 0.0000226 / 0.001 );// Just a starting value in aprox the range its going to be used in.
 
+	bool maximizer = false;
+
+	// Oversampling objects
+	static const int OVERSAMPLE = 4;
+	dsp::Upsampler<OVERSAMPLE, 12> upsampler[2];
+	dsp::Decimator<OVERSAMPLE, 12> decimator[2];
 
 	// VU Meter stuff
 	dsp::VuMeter2 vuMeterIn;
@@ -142,7 +150,7 @@ struct Non : Module {
 		//configParam(Non::T_NOISEGATE_PARAM,  THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_NOISEGATE_DB, "Noisegate", " dB", 0.0f, 1.0f);
 		//configParam(Non::T_EXPANDER_PARAM,   THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_EXPANDER_DB, "Expander", " dB", 0.0f, 1.0f);
 		//configParam(Non::T_COMPRESSOR_PARAM, THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_COMPRESSOR_DB, "Compressor", " dB", 0.0f, 1.0f);
-		configParam(Non::T_LIMITER_PARAM,    THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_LIMITER_DB, "Limiter", " dB", 0.0f, 1.0f);
+		configParam<Param3Digits>(Non::T_LIMITER_PARAM,    THRESHOLD_LIMIT_LOW_DB, THRESHOLD_LIMIT_HIGH_DB, THRESHOLD_DEFAULT_LIMITER_DB, "Limiter", " dB", 0.0f, 1.0f);
 		//configParam(Non::AVERAGE_TIME_PARAM, RMS_TIME_LOW_MS, RMS_TIME_HIGH_MS, RMS_TIME_DEFAULT_MS, "Lookahead", " ms", 0.0f, 1.0f);
 		//configParam(Non::ATTACK_PARAM, 0.0, 1.0, 0.5, "Attack", " ms", ATTACK_HIGH_MS / ATTACK_LOW_MS, ATTACK_LOW_MS);
 		configParam(Non::RELEASE_PARAM, 0.0, 1.0, 0.5, "Release", " ms", RELEASE_HIGH_MS / RELEASE_LOW_MS, RELEASE_LOW_MS);
@@ -150,7 +158,7 @@ struct Non : Module {
 		//configParam(Non::RATIO_EXPANDER_PARAM, 1.0, 0.0, 1.0, "Expander ratio  1 ", "", 1.0f / EXPANDER_RATIO_MIN, EXPANDER_RATIO_MIN);
 		//configParam(Non::RATIO_COMPRESSOR_PARAM, 0.0, 1.0, 0.0, "Compressor ratio", ":1", COMPRESSOR_RATIO_MAX / 1.0f, 1.0f);
 		//configParam(Non::KNEE_PARAM, 0.0, KNEE_MAX_DB, KNEE_DEFAULT_DB, "Knee softness", " dB", 0.0f, 1.0f);
-		configParam(Non::OUT_GAIN_PARAM, 0.0, 1.0, 0.0, "Makeup gain", " dB", 0.0f, 20.0f);
+		configParam<Param3Digits>(Non::OUT_GAIN_PARAM, 0.0, 1.0, 0.0, "Makeup gain", " dB", 0.0f, 20.0f);
 
 		//configLight(A, "Noise gate");
 		//configLight(B, "Expander");
@@ -176,6 +184,7 @@ struct Non : Module {
 
 	double toDB(double volt);
 	double toGain(double dB);
+	double toVolt(double dB);
 	double smooth(double k, double g_prev, double f);
 	double peak(double x, double ATp, double RT);
 	double peakW(double x, double ATp, double RT);
@@ -186,6 +195,23 @@ struct Non : Module {
 	double toExp10(double x, double min, double max);
 
 	void process(const ProcessArgs &args) override;
+
+	json_t *dataToJson() override {
+		json_t *root = json_object();
+		json_object_set_new(root, "maximizer", json_boolean(maximizer));
+		return root;
+	}
+
+	void dataFromJson(json_t *rootJ) override {
+		json_t *ext = json_object_get(rootJ, "maximizer");
+		if (ext)
+			maximizer = json_boolean_value(ext);
+	}
+
+	void onReset(const ResetEvent& e) override {
+		maximizer = false;
+		Module::onReset(e);
+	}
 };
 
 /*
@@ -310,7 +336,6 @@ void Non::process(const ProcessArgs &args) {
 	}
 	step++;
 
-	double LT = params[T_LIMITER_PARAM].getValue();
 	//double CT = params[T_COMPRESSOR_PARAM].getValue();
 	//double ET = params[T_EXPANDER_PARAM].getValue();
 	//double NT = params[T_NOISEGATE_PARAM].getValue();
@@ -332,14 +357,16 @@ void Non::process(const ProcessArgs &args) {
 	}*/
 	if (inputs[L_INPUT].isConnected()) {
 		if (inputs[L_INPUT].getVoltage() == 0.0f) LT = THRESHOLD_LIMIT_LOW_DB;
-		else LT = this->toDB(fabs(inputs[L_INPUT].getVoltage()));
-		params[T_LIMITER_PARAM].setValue(LT);
+		else LT = this->toDB(fabsf(inputs[L_INPUT].getVoltage()));
+		params[T_LIMITER_PARAM].setValue(std::max(LT, THRESHOLD_LIMIT_LOW_DB));
 	}
 
-	double TS = args.sampleTime * 1000.0; //ms
+	double TS = (args.sampleTime / OVERSAMPLE) * 1000.0; //ms
 
 	//if (taKnob != params[ATTACK_PARAM].getValue() || tapKnob != params[ATTACK_PEAK_PARAM].getValue() || trKnob != params[RELEASE_PARAM].getValue() || erKnob != params[RATIO_EXPANDER_PARAM].getValue() || crKnob != params[RATIO_COMPRESSOR_PARAM].getValue() || rate != args.sampleRate || tavKnob != params[AVERAGE_TIME_PARAM].getValue() || gainKnob != params[OUT_GAIN_PARAM].getValue()) {
-	if (tapKnob != params[ATTACK_PEAK_PARAM].getValue() || trKnob != params[RELEASE_PARAM].getValue() || rate != args.sampleRate || gainKnob != params[OUT_GAIN_PARAM].getValue()) {
+	if (tapKnob != params[ATTACK_PEAK_PARAM].getValue() || trKnob != params[RELEASE_PARAM].getValue()
+		|| rate != args.sampleRate || gainKnob != params[OUT_GAIN_PARAM].getValue()
+		|| (maximizer && LT != params[T_LIMITER_PARAM].getValue())) {
 		rate = args.sampleRate;
 		//tavKnob = params[AVERAGE_TIME_PARAM].getValue();
 		//D   = (unsigned)(rate * tavKnob * 0.001);
@@ -350,8 +377,10 @@ void Non::process(const ProcessArgs &args) {
 		//erKnob = params[RATIO_EXPANDER_PARAM].getValue();
 		//crKnob = params[RATIO_COMPRESSOR_PARAM].getValue();
 		gainKnob = params[OUT_GAIN_PARAM].getValue();
+		LT = params[T_LIMITER_PARAM].getValue();
 
-		D   = (unsigned)(rate * 0.15 * 0.001);
+		D   = (unsigned)(rate * LOOKAHEAD_MS * 0.001 * OVERSAMPLE);
+		if (D >= BUFFER_SIZE) D = BUFFER_SIZE - 1;       // Safety clamp
 
 		//ta = this->toExp10(taKnob,  ATTACK_LOW_MS, ATTACK_HIGH_MS);
 		tap = this->toExp10(tapKnob, ATTACK_LIMITER_LOW_MS, ATTACK_LIMITER_HIGH_MS);
@@ -359,6 +388,11 @@ void Non::process(const ProcessArgs &args) {
 		//ER = this->toExp10(erKnob,  EXPANDER_RATIO_MIN, 1.00);
 		//CR = this->toExp10(crKnob,  1.00, COMPRESSOR_RATIO_MAX);
 		makeupGain = this->toExp10(gainKnob, 1.00, MAKEUP_GAIN_MAX);
+		if (maximizer) {
+			double automaticMakeupDB = - LT; // Auto-gain to hit 0.0dB ceiling
+			if (automaticMakeupDB < 0) automaticMakeupDB = 0;
+			makeupGain *= this->toGain(automaticMakeupDB);
+		}
 
 		RT  = 1.0 - exp(-2.2 * TS / tr );
 		//AT  = 1.0 - exp(-2.2 * TS / ta );
@@ -366,128 +400,133 @@ void Non::process(const ProcessArgs &args) {
 
 		//double t_M = TS * D;
 		//TAV = 1.0 - exp(-2.2 * TS / t_M);
+	} else {
+		LT = params[T_LIMITER_PARAM].getValue();
 	}
 
-	unsigned hyst_max = HYSTERESIS_TIME_SEC / args.sampleTime;
+	//unsigned hyst_max = (unsigned)((HYSTERESIS_TIME_SEC / args.sampleTime) * OVERSAMPLE);
 	//unsigned hyst_max_attack = tapKnob / args.sampleTime;
 
 	// inputs:
-	float left  = inputs[LEFT_INPUT].getVoltage();
-	float right = inputs[RIGHT_INPUT].getVoltage();
-	bufferL.push(left);
-	bufferR.push(right);
-	float pastL = bufferL.front();
-	float pastR = bufferR.front();
-	while (bufferL.size() > D) {
-		bufferL.pop();
-		bufferR.pop();
-	}
-	double stereo = left + right;
+	float leftInput  = inputs[LEFT_INPUT].getVoltage();
+	float rightInput = inputs[RIGHT_INPUT].getVoltage();
 
-	if (inputs[SIDE_LEFT_INPUT].isConnected() || inputs[SIDE_RIGHT_INPUT].isConnected()) {
-		stereo = inputs[SIDE_LEFT_INPUT].getVoltage() + inputs[SIDE_RIGHT_INPUT].getVoltage();
-	}
+	// 1. Upsample
+	float inBufL[OVERSAMPLE];
+	float inBufR[OVERSAMPLE];
+	float outBufL[OVERSAMPLE];
+	float outBufR[OVERSAMPLE];
 
-	//double knee = params[KNEE_PARAM].getValue();//dB
+	upsampler[0].process(leftInput, inBufL);
+	upsampler[1].process(rightInput, inBufR);
 
-	// some values:
-	//double CS = 1.0 - 1.0 / CR;
-	//double ES = 1.0 - 1.0 / ER;
-	double LS = 1.0;
+	// Oversampled Loop
+	for (int i = 0; i < OVERSAMPLE; i++) {
+		float left = inBufL[i];
+		float right = inBufR[i];
 
-	// level measurement:
-	//double peak = this->peakW(stereo, ATp, RT); // Slightly slower version
-	double peak = this->peak(stereo, ATp, RT);
-	//double rms  = this->rms(stereo);
+		// Write to ring buffer
+		bufferL[writeIndex] = left;
+		bufferR[writeIndex] = right;
 
-	// static curve:
-	double f = this->staticCurve(peak, LT, LS);
+		// Read from ring buffer (Lookahead D samples behind)
+		// We add to ensure the result is positive before modulo
+		int readIndex = (writeIndex - (int)D + BUFFER_SIZE) % BUFFER_SIZE;
+		float pastL = bufferL[readIndex];
+		float pastR = bufferR[readIndex];
 
-	// smoothing filter:
-	double k = 0.0;
-	if (f >= g_prev && attack) {
-		// We are in attack and want release, hyst starts counting towards release
-		hysteresis += 1;
-	} else if (f >= g_prev && !attack) {
-		// We are in release and want to release even further, hyst not activating
-		hysteresis = 0;
-	} else if (f < g_prev && !attack) {
-		// We are in release and want attack, hyst starts counting towards attack
-		hysteresis += 1;
-	} else if (f < g_prev && attack) {
-		// We are in attack and want to keep that, hyst not activating
-		hysteresis = 0;
-	}
-	if (hysteresis > hyst_max && attack) {// _attack
-		hysteresis = 0;
-		attack = false;
-	} else if (hysteresis > hyst_max && !attack) { // _release
-		hysteresis = 0;
-		attack = true;
-	}
-	if (attack) {
-		//if (limiter) {
+		// Increment index wrapping
+		writeIndex = (writeIndex + 1) % BUFFER_SIZE;
+
+		double stereo = std::max(std::abs(left), std::abs(right));
+
+		if (inputs[SIDE_LEFT_INPUT].isConnected() || inputs[SIDE_RIGHT_INPUT].isConnected()) {
+			stereo = std::max(std::abs(inputs[SIDE_LEFT_INPUT].getVoltage()), std::abs(inputs[SIDE_RIGHT_INPUT].getVoltage()));
+		}
+
+		// some values:
+		double LS = 1.0;
+
+		// level measurement:
+		//double peak = this->peakW(stereo, ATp, RT); // Slightly slower version
+		double peak = this->peak(stereo, ATp, RT);
+
+		// static curve:
+		double f = this->staticCurve(peak, LT, LS);
+
+		bool signalWantsAttack = (f < g_prev);
+
+		double k = 0.0;
+
+		attack = signalWantsAttack;
+		if (attack) {
 			k = ATp;
-		/*} else {
-			k = AT;
-		}*/
-	} else {
-		k = RT;
-	}
-	//k = slew(k, k_prev, SMOOTH_FILTER_POLE_SLEW, args.sampleTime);
+		} else {
+			if (f > g_prev * 1.005f) {
+				k = RT;
+			} else {
+				k = 0.0f;
+			}
+		}
 
-	double g = this->smooth(k, g_prev, f);
+		double g = this->smooth(k, g_prev, f);
 
-	// apply gain:
-	float outL = pastL * g;
-	float outR = pastR * g;
-	if (!std::isfinite(outL) || !std::isfinite(outR)) {
-		outL = 0.0;
-		outR = 0.0;
-		peak_prev = 1.0;
-		peak = 1.0;
-		//rms2_prev = 1.0;
-		g_prev = 1.0;
-		f_prev = 1.0;
-		g = 1.0;
-		f = 1.0;
+		// Apply Gain & Makeup
+		float processedL = pastL * g * makeupGain;
+		float processedR = pastR * g * makeupGain;
+
+		// Safety Clamp (replacing tanh)
+		processedL = clamp(processedL, -12.0f, 12.0f);
+		processedR = clamp(processedR, -12.0f, 12.0f);
+
+		// Nan Check
+		if (!std::isfinite(processedL) || !std::isfinite(processedR)) {
+			processedL = 0.0;
+			processedR = 0.0;
+			g_prev = 1.0;
+			f = 1.0;
+			peak_prev = 1.0;
+			peak = 1.0;
+			f_prev = 1.0;
+			g = 1.0;
+		}
+
+		outBufL[i] = processedL;
+		outBufR[i] = processedR;
+
+		// set previous values for next step:
+		peak_prev = peak;
+		g_prev = g;
+		f_prev = f;
+		//k_prev = k;
 	}
-	outL *= makeupGain;
-	outL = non_lin_func(outL / 12.0f) * 12.0f;
+
+	// Downsample
+	float outL = decimator[0].process(outBufL);
+	float outR = decimator[1].process(outBufR);
+
 	outputs[LEFT_OUTPUT].setVoltage(outL);
-	outR *= makeupGain;
-	outR = non_lin_func(outR / 12.0f) * 12.0f;
 	outputs[RIGHT_OUTPUT].setVoltage(outR);
 
-
 	// VU meters
-	vuMeterIn.process(args.sampleTime, pastL * 0.1f);
-	vuMeterIn2.process(args.sampleTime, pastR * 0.1f);
+	vuMeterIn.process(args.sampleTime, leftInput * 0.1f);
+	vuMeterIn2.process(args.sampleTime, rightInput * 0.1f);
 	vuMeterOut.process(args.sampleTime, outL * 0.1f);
 	vuMeterOut2.process(args.sampleTime, outR * 0.1f);
 	//vuMeterOut.mode = dsp::VuMeter2::RMS;
 	for (int v = 0; step == 512 && v < 15; v++) {
-		lights[VU_IN_LEFT_LIGHT + 14 - v].setBrightness(vuMeterIn.getBrightness(-intervalDB * (v + 1), -intervalDB * v));
-		lights[VU_IN_RIGHT_LIGHT + 14 - v].setBrightness(vuMeterIn2.getBrightness(-intervalDB * (v + 1), -intervalDB * v));
-		lights[VU_OUT_LEFT_LIGHT + 14 - v].setBrightness(vuMeterOut.getBrightness(-intervalDB * (v + 1), -intervalDB * v));
-		lights[VU_OUT_RIGHT_LIGHT + 14 - v].setBrightness(vuMeterOut2.getBrightness(-intervalDB * (v + 1), -intervalDB * v));
+		float upper = -intervalDB * v;
+		float lower = -intervalDB * (v + 1.0f);
+		lights[VU_IN_LEFT_LIGHT + 14 - v].setBrightness(vuMeterIn.getBrightness(lower, upper));
+		lights[VU_IN_RIGHT_LIGHT + 14 - v].setBrightness(vuMeterIn2.getBrightness(lower, upper));
+		lights[VU_OUT_LEFT_LIGHT + 14 - v].setBrightness(vuMeterOut.getBrightness(lower, upper));
+		lights[VU_OUT_RIGHT_LIGHT + 14 - v].setBrightness(vuMeterOut2.getBrightness(lower, upper));
 	}
 	if (step == 512) {
 		step = 0;
 	}
 
-	// set previous values for next step:
-	peak_prev = peak;
-	g_prev = g;
-	f_prev = f;
-	//k_prev = k;
-}
 
-
-
-double Non::toExp10(double x, double min, double max) {
-	// 0 to 1 to exp range
-	return min * pow(10.0, x * log10(max / min));
 }
 
 //double Non::staticCurve(double rms, double peak, double LT, double LS, double CS, double CT, double CR, 
@@ -506,8 +545,8 @@ double Non::staticCurve(double peak, double LT, double LS) {
 	if (peak_dB > LT) {// hard knee:
 		// limiter
 		G = (peak_dB - LT) * (-LS);// - CS * (LT - CT);
-		lights[E].value = 1.0;
-		lights[C].value  = 0.0;
+		lights[E].value = 1.0f;
+		lights[C].value  = 0.0f;
 		limiter = true;
 	} else {
 		/*double x_dB = this->toDB(sqrt(rms));
@@ -528,8 +567,8 @@ double Non::staticCurve(double peak, double LT, double LS) {
 			lights[C].value = 0.5;
 		} else if (x_dB < CTknee) {*/
 			// neutral
-			lights[C].value = 1.0;
-			lights[E].value  = 0.0;
+			lights[C].value = 1.0f;
+			lights[E].value  = 0.0f;
 			G = 0.0;
 		/*} else if (knee > 0.0 && x_dB < CTknee + knee) {
 			// semi compressor
@@ -574,13 +613,43 @@ double Non::smooth(double k, double g_prev, double f) {
 	return (1.0 - k) * g_prev + k * f;
 }
 
+double Non::toExp10(double x, double min, double max) {
+	// 0 to 1 to exp range
+	return min * pow(10.0, x * log10(max / min));
+}
+
 double Non::toDB(double volt) {
-	return 20.0 * log10(volt / 5.0);
+	// Safety Check. Prevent log10(0) or log10(negative).
+	// 0.000001 is -134dB, which is effectively silence in 32-bit float.
+	double v = std::max(std::abs(volt), 0.000001);
+	return 20.0 * log10(v / 5.0);
 }
 
 double Non::toGain(double dB) {
 	return pow(10.0, (dB / 20.0)); //I don't multiply with 5v here as its a ratio.
 }
+
+double Non::toVolt(double dB) {
+	return 5.0 * pow(10.0, (dB / 20.0));
+}
+
+struct MaximizerMenuItem : MenuItem {
+	Non* _module;
+
+	MaximizerMenuItem(Non* module, const char* label)
+	: _module(module)
+	{
+		this->text = label;
+	}
+
+	void onAction(const event::Action &e) override {
+		_module->maximizer = !_module->maximizer;
+	}
+
+	void step() override {
+		rightText = _module->maximizer == true ? "✔" : "";
+	}
+};
 
 struct NonWidget : ModuleWidget {
 	NonWidget(Non *module) {
@@ -649,6 +718,14 @@ struct NonWidget : ModuleWidget {
 			addChild(createLight<SmallLight<RedLight>>(Vec(16 * RACK_GRID_WIDTH * light_x_pos - HALF_LIGHT_SMALL + light_column_dist, light_y_pos - light_y_spacing * i), module, Non::VU_OUT_LEFT_LIGHT + i));
 			addChild(createLight<SmallLight<RedLight>>(Vec(16 * RACK_GRID_WIDTH * light_x_pos - HALF_LIGHT_SMALL + light_column_dist + HALF_LIGHT_SMALL * 2.0f, light_y_pos - light_y_spacing * i), module, Non::VU_OUT_RIGHT_LIGHT + i));
 		}
+	}
+
+	void appendContextMenu(Menu* menu) override {
+		Non* a = dynamic_cast<Non*>(module);
+		assert(a);
+
+		menu->addChild(new MenuLabel());
+		menu->addChild(new MaximizerMenuItem(a, "Maximizer"));
 	}
 };
 
