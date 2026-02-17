@@ -63,7 +63,11 @@ void init(rack::Plugin *p) {
 	p->addModel(modelFil);
 	p->addModel(modelNap);
 	p->addModel(modelMelody);
-	// p->addModel(modelChord);
+	p->addModel(modelChord);
 	p->addModel(modelCoil);
+	p->addModel(modelGeiger);
+	p->addModel(modelKicker);
+	p->addModel(modelSaw2);
+	p->addModel(modelSnare);
 	p->addModel(modelScope);
 }
